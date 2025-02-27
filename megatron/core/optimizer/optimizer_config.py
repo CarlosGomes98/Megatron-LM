@@ -157,6 +157,9 @@ class OptimizerConfig:
     timers: Callable = None
     """Function to get timers."""
 
+    capturable: bool = False
+    """If true, make the optimizer step capturable."""
+
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
 
