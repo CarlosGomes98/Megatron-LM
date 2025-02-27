@@ -44,6 +44,11 @@ class OptimizerConfig:
     bf16: bool = False
     """If true, train with bf16 mixed precision training. Defaults to False."""
 
+    master_weights: bool = False
+    """Whether to maintain FP32 master weights in the optimizer with FP16/BF16 mixed precision training.
+    Defaults to False.
+    """
+
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights. Defaults to torch.float32."""
 
@@ -158,7 +163,7 @@ class OptimizerConfig:
     """Function to get timers."""
 
     capturable: bool = False
-    """If true, make the optimizer step capturable."""
+    """If true, make the optimizer step capturable by CUDA graphs. Defaults to False."""
 
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
