@@ -124,9 +124,15 @@ class GatedDeltaNet(MegatronModule):
         self.cp_size = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
+        self.gdn_pre_gated_delta_rule_fusion = config.gdn_pre_gated_delta_rule_fusion
 
         # Attributes from config
         self.config = config
+        if self.config.deterministic_mode and self.gdn_pre_gated_delta_rule_fusion:
+            raise ValueError(
+                "Pre-GDR fusion is non-deterministic, but deterministic_mode=True. "
+                "Disable gdn_pre_gated_delta_rule_fusion or deterministic_mode."
+            )
         self.hidden_size = config.hidden_size
         self.act_fn = config.activation_func
         self.activation = self.act_fn.__name__
@@ -348,6 +354,7 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="in_proj")
 
         # CP All to All: CP to HP
+        thd_cp_a2a_inv = None
         if self.cp_size > 1:
             # # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
             head_perm = _build_head_perm_for_split_sections(
@@ -382,6 +389,16 @@ class GatedDeltaNet(MegatronModule):
         else:
             qkvzba = tensor_a2a_cp2hp(
                 qkvzba, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+            )
+
+        if self.gdn_pre_gated_delta_rule_fusion:
+            return self._forward_fused_pre_gated_delta_rule(
+                qkvzba,
+                batch,
+                seq_len,
+                cu_seqlens_q,
+                packed_seq_params,
+                thd_cp_a2a_inv,
             )
 
         # Transpose: s b x --> b s x
@@ -527,6 +544,110 @@ class GatedDeltaNet(MegatronModule):
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
+
+    def _forward_fused_pre_gated_delta_rule(
+        self,
+        qkvzba: torch.Tensor,
+        batch: int,
+        seq_len: int,
+        cu_seqlens_q: Optional[torch.Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        thd_cp_a2a_inv: Optional[torch.Tensor],
+    ):
+        """Run the PR #5361 pre-GDR fusion while preserving this pin's output path."""
+        nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
+        seq_idx = (
+            getattr(packed_seq_params, "seq_idx", None)
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+            else None
+        )
+        query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
+            qkvzba, cu_seqlens_q=cu_seqlens_q, seq_idx=seq_idx
+        )
+        nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
+
+        nvtx_range_push(suffix="gated_delta_rule")
+        core_attn_out, _ = self.gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens_q,
+        )
+        nvtx_range_pop(suffix="gated_delta_rule")
+
+        def _gated_norm_and_a2a(core_attn_out: torch.Tensor, gate: torch.Tensor):
+            nvtx_range_push(suffix="gated_norm")
+            norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
+            nvtx_range_pop(suffix="gated_norm")
+
+            norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
+            norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
+
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                if self.cp_size > 1:
+                    assert thd_cp_a2a_inv is not None
+                    norm_out_hp = norm_out_hp.index_select(0, thd_cp_a2a_inv)
+                norm_out = tensor_a2a_hp2cp(
+                    norm_out_hp,
+                    seq_dim=0,
+                    head_dim=-1,
+                    cp_group=self.pg_collection.cp,
+                    redo_attention_load_balancing=False,
+                )
+            else:
+                norm_out = tensor_a2a_hp2cp(
+                    norm_out_hp, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+                )
+            return norm_out
+
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            norm_out = self.norm_out_checkpoint.checkpoint(
+                _gated_norm_and_a2a, core_attn_out, gate
+            )
+        else:
+            norm_out = _gated_norm_and_a2a(core_attn_out, gate)
+
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
+
+        return out, out_bias
+
+    def _fused_streamed_pre_gated_delta_rule(self, qkvzba, cu_seqlens_q=None, seq_idx=None):
+        """Call the streamed fused pre-GDR wrapper from PR #5361."""
+        try:
+            from megatron.core.fusions.fused_pre_gated_delta_rule import (
+                fused_streamed_pre_gated_delta_rule,
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "gdn_pre_gated_delta_rule_fusion requires the streamed pre-GDR fusion "
+                "dependencies, including causal-conv1d."
+            ) from exc
+
+        return fused_streamed_pre_gated_delta_rule(
+            qkvzba,
+            self.conv1d.weight,
+            self.conv1d.bias if self.conv_bias else None,
+            self.A_log,
+            self.dt_bias,
+            num_key_heads=self.qk_dim_local_tp // self.key_head_dim,
+            num_value_heads=self.v_dim_local_tp // self.value_head_dim,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+            use_qk_l2norm=self.use_qk_l2norm,
+            cu_seqlens=cu_seqlens_q,
+            seq_idx=seq_idx,
+        )
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
